@@ -1,0 +1,290 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel SurfaceGen
+#pragma kernel CaveGen
+#pragma kernel AddCaves
+#pragma kernel AddGrass
+#pragma kernel InitialCave
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+Texture2D<float4> perlinNoise;
+float surfaceHeight;
+float surfaceRelief;
+int xSize;
+int ySize;
+int zSize;
+int seed;
+
+
+//Define a cube
+struct Cube
+{
+	int blockType;
+};
+
+//Create a "Random" number
+float rand(float2 pos)
+{
+	float result = frac(sin(seed / 100.0f * dot(pos, float2(12.9898f, 78.233f))) * 43758.5453f);
+	seed += 1.0f;
+	return result;
+}
+
+//SurfaceGen
+
+Cube tempCube1;
+
+RWStructuredBuffer<Cube> cubes;
+
+//Calculate the surface based on perlin noise
+int calculateSurfaceType(float noiseValue, int y) 
+{
+	float surfaceDepth = float(4) * surfaceRelief;
+	if ((y < surfaceHeight * ySize - (surfaceRelief * float(2)) + noiseValue * surfaceDepth))
+	{
+		return 1;
+	}
+	else 
+	{
+		return 0;
+	}
+}
+
+//Generate surface relief
+[numthreads(4, 4, 4)]
+void SurfaceGen (int3 id : SV_DispatchThreadID)
+{	
+	//Get the cube
+	tempCube1 = cubes[id.x + id.y * xSize + id.z * xSize * ySize];
+	//Get a perlin noise value
+	float4 color = perlinNoise[id.xz];
+	//Set the type value based on y height and perlin noise
+
+	tempCube1.blockType = calculateSurfaceType(color.r, id.y);
+
+	cubes[id.x + id.y * xSize + id.z * xSize * ySize] = tempCube1;
+}
+
+//Cave Gen -------------
+
+RWStructuredBuffer<Cube> cubes2;
+StructuredBuffer<Cube> cubesOld;
+Cube tempCube2;
+Cube tempCube3;
+int deathCount;
+int birthCount;
+
+
+//Get the value of a cell
+int getCell(int3 cell) 
+{
+	//All cells off the grid are alive
+	if (cell.x < 0 || cell.x >= xSize) 
+	{
+		return 1;
+	}
+	if (cell.y < 0 || cell.y >= ySize)
+	{
+		return 1;
+	}
+	if (cell.z < 0 || cell.z >= zSize)
+	{
+		return 1;
+	}
+	//Get if this cell is dead of alive
+	return cubesOld[cell.x + cell.y * xSize + cell.z * xSize * ySize].blockType;
+}
+
+//Run cellularAutomata on the cell
+int cellularAutomata(int3 id) 
+{
+	int count = 0;
+	int3 cellId;
+	
+	//Get x, y and z values between 0 and 2
+	for (int x = 0; x < 3; x++)
+	{
+		for (int y = 0; y < 3; y++)
+		{
+			for (int z = 0; z < 3; z++)
+			{
+				//Skip the cell itself
+				if (!(x == 1 && y == 1 && z == 1))
+				{
+					cellId = id;
+					cellId.x = cellId.x - 1 + x;
+					cellId.y = cellId.y - 1 + y;
+					cellId.z = cellId.z - 1 + z;
+
+					//Use the values to get a x, y and z that's -1, 0 and 1
+					//cellId = (id.x - 1 + x, id.y - 1 + y, id.z - 1 + z);
+					count += getCell(cellId);
+				}
+			}
+		}
+	}
+
+	//If the cell is dead and the count is bigger than the birthcount the cell now lives
+	if (cubesOld[id.x + id.y * xSize + id.z * xSize * ySize].blockType == 0 && count > birthCount)
+	{
+		return 1;
+	}
+	//If the cell is alive and the count is smaller than the deathCount the cell dies
+	if (cubesOld[id.x + id.y * xSize + id.z * xSize * ySize].blockType == 1 && count < deathCount)
+	{
+		return 0;
+	}
+	//If neither if statement was succesfull do nothing
+	return cubesOld[id.x + id.y * xSize + id.z * xSize * ySize].blockType;
+}
+
+//Generate caves via game of life
+[numthreads(4, 4, 4)]
+void CaveGen(int3 id : SV_DispatchThreadID) 
+{
+	//Get the cell that is checked
+	tempCube2 = cubes2[id.x + id.y * xSize + id.z * xSize * ySize];
+	//Run cellular Automata on this cell
+	tempCube2.blockType = cellularAutomata(id);
+	//Return the cell
+	cubes2[id.x + id.y * xSize + id.z * xSize * ySize] = tempCube2;
+}
+
+
+//AddCaves -----------------------
+RWStructuredBuffer<Cube> surface;
+StructuredBuffer<Cube> caves;
+Cube tempCube4;
+
+//Return 0 when cell is 0 in either array
+int CombineCell(int index) 
+{
+	//Check if the cell in either array is 0
+	if (surface[index].blockType == 0 || caves[index].blockType == 0) 
+	{
+		return 0;
+	}
+	//If no 0 was found keep the cell as it was
+	else 
+	{
+		return surface[index].blockType;
+	}
+}
+
+//Combine cave and surface arrays
+[numthreads(4, 4, 4)]
+void AddCaves(uint3 id : SV_DispatchThreadID)
+{
+	//Get the cell that is checked
+	tempCube4 = surface[id.x + id.y * xSize + id.z * xSize * ySize];
+	//Combine arrays for this cell
+	tempCube4.blockType = CombineCell(id.x + id.y * xSize + id.z * xSize * ySize);
+	//Return the cell
+	surface[id.x + id.y * xSize + id.z * xSize * ySize] = tempCube4;
+}
+
+
+//AddGrass --------------------------
+RWStructuredBuffer<Cube> surface2;
+Cube tempCube5;
+
+//Change cell to grass or dirt based on cell above it
+int GrassCheck(int3 id) 
+{
+	//Make a copy of id to be able to edit it
+	int3 cell = id;
+	//No need to check up when at the highest possible cell
+	if (cell.y == ySize) 
+	{
+		//Since there cannot be anything above this cell return grass
+		return 2;
+	}
+	//Go one cell up
+	cell.y += 1;
+	//Get the blocktype of the cell above
+	int blockType = surface2[cell.x + cell.y * xSize + cell.z * xSize * ySize].blockType;
+
+	//If you find air
+	if (blockType == 0) 
+	{
+		//Return grass
+		return 2;
+	}
+	//If you find grass
+	if (blockType == 2)
+	{
+		//Return dirt
+		return 3;
+	}
+	//If you find dirt
+	if (blockType == 3)
+	{
+		//Only 50% of the time it turns to dirt
+		if (rand(float2(cell.x, cell.y)) > float(0.5))
+		{
+			//Return dirt
+			return 3;
+		}
+		else
+		{
+			//Return stone
+			return 1;
+		}
+	}
+	//Default return is stone
+	return 1;
+}
+
+//Add grass and dirt to the surface
+[numthreads(4, 4, 4)]
+void AddGrass(int3 id : SV_DispatchThreadID)
+{
+	//Get the current cell
+	tempCube5 = surface2[id.x + id.y * xSize + id.z * xSize * ySize];
+	//We only change stone to grass or dirt
+	if (tempCube5.blockType == 1) 
+	{
+		//Change the blockType
+		tempCube5.blockType = GrassCheck(id);
+	}
+	//Return the current cell back into the array
+	surface2[id.x + id.y * xSize + id.z * xSize * ySize] = tempCube5;
+}
+
+
+
+//InitialCave ----------------------------
+RWStructuredBuffer<Cube> caves2;
+Cube tempCube6;
+float initialSolid;
+float surfaceSolid;
+
+
+//Fill a cell randomly with 0 or 1
+int RandomFill(int3 id)
+{
+	//Get a random float2 based on id so that all three axis are used
+	float2 rnd = float2(rand(float2(id.x, id.z)), rand(float2(id.y, id.z)));
+
+	//Surface has a lower chance to have caves
+	if ((id.y > ySize * surfaceHeight - surfaceRelief && rand(rnd) < surfaceSolid) || rand(rnd) < initialSolid)
+	{
+		return 1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+//Create the initial random state of the caves
+[numthreads(4, 4, 4)]
+void InitialCave(int3 id : SV_DispatchThreadID)
+{
+	//Get the current cell
+	tempCube6 = caves2[id.x + id.y * xSize + id.z * xSize * ySize];
+	//We only change stone to grass or dirt
+	tempCube6.blockType = RandomFill(id);
+	//Return the current cell back into the array
+	caves2[id.x + id.y * xSize + id.z * xSize * ySize] = tempCube6;
+}
